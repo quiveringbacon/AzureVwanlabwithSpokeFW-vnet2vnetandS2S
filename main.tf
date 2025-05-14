@@ -41,6 +41,10 @@ resource "azurerm_resource_group" "RG" {
 data "azurerm_subscription" "sub" {
 }
 
+resource "random_pet" "name" {
+  length = 1
+}
+
 resource "azurerm_logic_app_workflow" "workflow1" {
   location = azurerm_resource_group.RG.location
   name     = "labdelete"
@@ -140,22 +144,62 @@ resource "azurerm_resource_group_template_deployment" "apiconnections" {
                         }
                     },
                     "actions": {
-                        "Delete_a_resource_group": {
-                            "runAfter": {},
-                            "type": "ApiConnection",
-                            "inputs": {
-                                "host": {
-                                    "connection": {
-                                        "name": "@parameters('$connections')['arm']['connectionId']"
-                                    }
-                                },
-                                "method": "delete",
-                                "path": "/subscriptions/@{encodeURIComponent('${data.azurerm_subscription.sub.subscription_id}')}/resourcegroups/@{encodeURIComponent('${azurerm_resource_group.RG.name}')}",
-                                "queries": {
-                                    "x-ms-api-version": "2016-06-01"
-                                }
+                        "remove_spoke1_connection": {
+                          "runAfter": {},
+                          "type": "Http",
+                          "inputs": {
+                            "uri": "https://management.azure.com/subscriptions/${data.azurerm_subscription.sub.subscription_id}/resourceGroups/${azurerm_resource_group.RG.name}/providers/Microsoft.Network/virtualHubs/vhub1/hubVirtualNetworkConnections/tospoke1?api-version=2024-05-01",
+                          "method": "DELETE",
+                          "authentication": {
+                            "type": "ManagedServiceIdentity"
+                          }
+                        },
+                        "runtimeConfiguration": {
+                            "contentTransfer": {
+                                "transferMode": "Chunked"
+                              }
                             }
+                        },
+                        "remove_spoke2_connection": {
+                          "runAfter": {
+                            "remove_spoke1_connection": [
+                                "Succeeded"
+                            ]
+                        },
+                          "type": "Http",
+                          "inputs": {
+                          "uri": "https://management.azure.com/subscriptions/${data.azurerm_subscription.sub.subscription_id}/resourceGroups/${azurerm_resource_group.RG.name}/providers/Microsoft.Network/virtualHubs/vhub1/hubVirtualNetworkConnections/tospoke2?api-version=2024-05-01",
+                          "method": "DELETE",
+                          "authentication": {
+                            "type": "ManagedServiceIdentity"
+                          }
+                        },
+                        "runtimeConfiguration": {
+                          "contentTransfer": {
+                            "transferMode": "Chunked"
+                            }
+                          }
+                        },
+                        "Delete_a_resource_group": {
+                            "runAfter": {
+                              "remove_spoke2_connection": [
+                                "Succeeded"
+                                ]
+                            },
+                        "type": "ApiConnection",
+                        "inputs": {
+                            "host": {
+                                "connection": {
+                                    "name": "@parameters('$connections')['arm']['connectionId']"
+                                }
+                            },
+                        "method": "delete",
+                        "path": "/subscriptions/@{encodeURIComponent('${data.azurerm_subscription.sub.subscription_id}')}/resourcegroups/@{encodeURIComponent('${azurerm_resource_group.RG.name}')}",
+                          "queries": {
+                            "x-ms-api-version": "2016-06-01"
+                          }
                         }
+                      }
                     },
                     "outputs": {}
                 },
@@ -354,6 +398,39 @@ resource "azurerm_virtual_network" "onprem-vnet" {
   
 }
 
+resource "azurerm_virtual_hub_route_table" "vnetRT" {
+  name = "vnetRT"
+  virtual_hub_id = azurerm_virtual_hub.vhub1.id
+  route {
+    name = "tospoke1"
+    destinations = ["10.150.0.0/16"]
+    destinations_type = "CIDR"
+    next_hop = azurerm_virtual_hub_connection.tofirewallvnet.id
+    next_hop_type = "ResourceId"
+  }
+  route {
+    name = "tospoke2"
+    destinations = ["10.250.0.0/16"]
+    destinations_type = "CIDR"
+    next_hop = azurerm_virtual_hub_connection.tofirewallvnet.id
+    next_hop_type = "ResourceId"
+  }
+  route {
+    name = "to-onprem"
+    destinations = ["192.168.0.0/16"]
+    destinations_type = "CIDR"
+    next_hop = azurerm_virtual_hub_connection.tofirewallvnet.id
+    next_hop_type = "ResourceId"
+  }
+  route {
+    name = "toFW"
+    destinations = ["0.0.0.0/0"]
+    destinations_type = "CIDR"
+    next_hop = azurerm_virtual_hub_connection.tofirewallvnet.id
+    next_hop_type = "ResourceId"
+  }
+}
+
 #vnet connections to hub
 resource "azurerm_virtual_hub_connection" "tofirewallvnet" {
   name                      = "tofirewallvnet"
@@ -361,6 +438,16 @@ resource "azurerm_virtual_hub_connection" "tofirewallvnet" {
   virtual_hub_id            = azurerm_virtual_hub.vhub1.id
   remote_virtual_network_id = azurerm_virtual_network.firewall-vnet.id
   routing {
+    static_vnet_route {
+      name = "tospoke1"
+      address_prefixes = ["10.150.0.0/16"]
+      next_hop_ip_address = "10.50.2.4"
+    }
+    static_vnet_route {
+      name = "tospoke2"
+      address_prefixes = ["10.250.0.0/16"]
+      next_hop_ip_address = "10.50.2.4"
+    }
     static_vnet_route {
       name = "toFW"
       address_prefixes = ["0.0.0.0/0"]
@@ -373,15 +460,33 @@ resource "azurerm_virtual_hub_connection" "tospoke1" {
   internet_security_enabled = true
   virtual_hub_id            = azurerm_virtual_hub.vhub1.id
   remote_virtual_network_id = azurerm_virtual_network.spoke1-vnet.id
+  routing {
+    associated_route_table_id = azurerm_virtual_hub_route_table.vnetRT.id
+    propagated_route_table {
+      route_table_ids = [data.azurerm_virtual_hub_route_table.hubnonert.id]
+    }
+  }
 }
 resource "azurerm_virtual_hub_connection" "tospoke2" {
   name                      = "tospoke2"
   internet_security_enabled = true
   virtual_hub_id            = azurerm_virtual_hub.vhub1.id
   remote_virtual_network_id = azurerm_virtual_network.spoke2-vnet.id
+  routing {
+    associated_route_table_id = azurerm_virtual_hub_route_table.vnetRT.id
+    propagated_route_table {
+      route_table_ids = [data.azurerm_virtual_hub_route_table.hubnonert.id]
+    }
+  }
 }
 
 #add route to default table
+data "azurerm_virtual_hub_route_table" "hubnonert" {
+  name                = "noneRouteTable"
+  resource_group_name = azurerm_resource_group.RG.name
+  virtual_hub_name    = azurerm_virtual_hub.vhub1.name
+}
+
 data "azurerm_virtual_hub_route_table" "hubdefaultrt" {
   name                = "defaultRouteTable"
   resource_group_name = azurerm_resource_group.RG.name
@@ -390,11 +495,88 @@ data "azurerm_virtual_hub_route_table" "hubdefaultrt" {
 resource "azurerm_virtual_hub_route_table_route" "route1" {
   route_table_id = data.azurerm_virtual_hub_route_table.hubdefaultrt.id
 
+  name              = "tospoke1"
+  destinations_type = "CIDR"
+  destinations      = ["10.150.0.0/16"]
+  next_hop_type     = "ResourceId"
+  next_hop          = azurerm_virtual_hub_connection.tofirewallvnet.id
+}
+resource "azurerm_virtual_hub_route_table_route" "route2" {
+  route_table_id = data.azurerm_virtual_hub_route_table.hubdefaultrt.id
+
+  name              = "tospoke2"
+  destinations_type = "CIDR"
+  destinations      = ["10.250.0.0/16"]
+  next_hop_type     = "ResourceId"
+  next_hop          = azurerm_virtual_hub_connection.tofirewallvnet.id
+}
+resource "azurerm_virtual_hub_route_table_route" "route3" {
+  route_table_id = data.azurerm_virtual_hub_route_table.hubdefaultrt.id
+
   name              = "toFW"
   destinations_type = "CIDR"
   destinations      = ["0.0.0.0/0"]
   next_hop_type     = "ResourceId"
   next_hop          = azurerm_virtual_hub_connection.tofirewallvnet.id
+}
+
+
+#vnet peering 
+resource "azurerm_virtual_network_peering" "spoke1tofw" {
+  name = "tofwspoke"  
+  virtual_network_name = azurerm_virtual_network.spoke1-vnet.name  
+  remote_virtual_network_id = azurerm_virtual_network.firewall-vnet.id
+  resource_group_name       = azurerm_resource_group.RG.name  
+  allow_forwarded_traffic = true
+  allow_gateway_transit = true
+  timeouts {
+    create = "2h"
+    read = "2h"
+    update = "2h"
+    delete = "2h"
+  }
+}
+resource "azurerm_virtual_network_peering" "fwtospoke1" {
+  name = "tospoke1"  
+  virtual_network_name = azurerm_virtual_network.firewall-vnet.name  
+  remote_virtual_network_id = azurerm_virtual_network.spoke1-vnet.id
+  resource_group_name       = azurerm_resource_group.RG.name  
+  allow_forwarded_traffic = true
+  allow_gateway_transit = true
+  timeouts {
+    create = "2h"
+    read = "2h"
+    update = "2h"
+    delete = "2h"
+  }
+}
+resource "azurerm_virtual_network_peering" "spoke2tofw" {
+  name = "tofwspoke"  
+  virtual_network_name = azurerm_virtual_network.spoke2-vnet.name  
+  remote_virtual_network_id = azurerm_virtual_network.firewall-vnet.id
+  resource_group_name       = azurerm_resource_group.RG.name  
+  allow_forwarded_traffic = true
+  allow_gateway_transit = true
+  timeouts {
+    create = "2h"
+    read = "2h"
+    update = "2h"
+    delete = "2h"
+  }
+}
+resource "azurerm_virtual_network_peering" "fwtospoke2" {
+  name = "tospoke2"  
+  virtual_network_name = azurerm_virtual_network.firewall-vnet.name  
+  remote_virtual_network_id = azurerm_virtual_network.spoke2-vnet.id
+  resource_group_name       = azurerm_resource_group.RG.name  
+  allow_forwarded_traffic = true
+  allow_gateway_transit = true
+  timeouts {
+    create = "2h"
+    read = "2h"
+    update = "2h"
+    delete = "2h"
+  }
 }
 
 #NSG
@@ -561,14 +743,14 @@ resource "azurerm_firewall" "azfw" {
 
 #log analytics workspace
 resource "azurerm_log_analytics_workspace" "LAW" {
-  name                = "LAW-01"
+  name                = "LAW-${random_pet.name.id}"
   location            = azurerm_resource_group.RG.location
   resource_group_name = azurerm_resource_group.RG.name
 }
 
 #firewall logging
 resource "azurerm_monitor_diagnostic_setting" "fwlogs"{
-  name = "fwlogs"
+  name = "fwlogs-${random_pet.name.id}"
   target_resource_id = azurerm_firewall.azfw.id
   log_analytics_workspace_id = azurerm_log_analytics_workspace.LAW.id
   log_analytics_destination_type = "Dedicated"
